@@ -1,3 +1,4 @@
+using Unity.AI.Navigation;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
@@ -19,6 +20,15 @@ using UnityEngine.SceneManagement;
 public static class DeadWaveStageBuilder
 {
     private const string ScenePath = "Assets/Scenes/DeadWave_Stage.unity";
+
+    // AKM viewmodel mounting. The rifle is auto-measured and auto-fitted at build
+    // time, so import scale and pivot don't matter. If it points backwards, set
+    // AkmFlip180 = true and rebuild.
+    private const bool AkmFlip180 = true;
+    private const string AkmPrefabPath = "Assets/DelthorGames/AKM/Prefabs/AKM.prefab";
+    private const float RifleTargetLength = 0.95f; // meters, stock to muzzle
+    private static readonly Vector3 RifleMountLocal = new Vector3(0.24f, -0.2f, 0.5f); // camera space
+    private static readonly Vector3 MuzzleTipFallbackLocal = new Vector3(0.24f, -0.16f, 1.0f);
 
     [MenuItem("Dead Wave/Build Stage Scene")]
     public static void BuildStageScene()
@@ -234,6 +244,118 @@ public static class DeadWaveStageBuilder
 
         player.AddComponent<PlayerController>();
 
+        // --- Weapon: AKM viewmodel under the camera --------------------------------
+        WeaponController weapon = cameraObject.AddComponent<WeaponController>();
+
+        Transform muzzleTip = new GameObject("Muzzle Tip").transform;
+        muzzleTip.SetParent(cameraObject.transform, false);
+        muzzleTip.localPosition = MuzzleTipFallbackLocal;
+
+        GameObject akmPrefab = AssetDatabase.LoadAssetAtPath<GameObject>(AkmPrefabPath);
+        if (akmPrefab != null)
+        {
+            GameObject akm = (GameObject)PrefabUtility.InstantiatePrefab(akmPrefab);
+            akm.name = "AKM Viewmodel";
+            akm.transform.SetParent(cameraObject.transform, false);
+            akm.transform.localPosition = Vector3.zero;
+            akm.transform.localRotation = Quaternion.identity;
+            akm.transform.localScale = Vector3.one;
+
+            foreach (Collider akmCollider in akm.GetComponentsInChildren<Collider>())
+            {
+                Object.DestroyImmediate(akmCollider);
+            }
+
+            // The pack ships a Built-in "Standard (Specular setup)" material, which
+            // URP can't render. Build our own URP material from its textures and
+            // hard-assign it - deterministic, survives every rebuild.
+            Material akmMaterial = BuildAkmUrpMaterial();
+            foreach (Renderer akmRenderer in akm.GetComponentsInChildren<Renderer>())
+            {
+                akmRenderer.sharedMaterial = akmMaterial;
+            }
+
+            // Auto-fit: align the barrel (longest axis) to +Z, scale to a realistic
+            // length, then mount low-right of the camera by the measured center.
+            Bounds bounds = CalculateBoundsInSpace(akm.transform, cameraObject.transform);
+            Vector3 size = bounds.size;
+            if (size.x >= size.y && size.x >= size.z)
+            {
+                akm.transform.localRotation = Quaternion.Euler(0f, -90f, 0f);
+            }
+            else if (size.y > size.x && size.y > size.z)
+            {
+                akm.transform.localRotation = Quaternion.Euler(90f, 0f, 0f);
+            }
+            if (AkmFlip180)
+            {
+                akm.transform.localRotation = Quaternion.Euler(0f, 180f, 0f) * akm.transform.localRotation;
+            }
+
+            bounds = CalculateBoundsInSpace(akm.transform, cameraObject.transform);
+            float longest = Mathf.Max(bounds.size.x, Mathf.Max(bounds.size.y, bounds.size.z));
+            if (longest > 0.0001f)
+            {
+                akm.transform.localScale = Vector3.one * (RifleTargetLength / longest);
+            }
+
+            bounds = CalculateBoundsInSpace(akm.transform, cameraObject.transform);
+            akm.transform.localPosition += RifleMountLocal - bounds.center;
+
+            bounds = CalculateBoundsInSpace(akm.transform, cameraObject.transform);
+            muzzleTip.localPosition = new Vector3(bounds.center.x, bounds.center.y, bounds.max.z);
+
+            weapon.rifleModel = akm.transform;
+        }
+        else
+        {
+            Debug.LogWarning($"Dead Wave: AKM prefab not found at {AkmPrefabPath}; no viewmodel attached.");
+        }
+
+        Light muzzleLight = muzzleTip.gameObject.AddComponent<Light>();
+        muzzleLight.type = LightType.Point;
+        muzzleLight.range = 5f;
+        muzzleLight.intensity = 0f;
+        muzzleLight.color = new Color(1f, 0.72f, 0.35f);
+
+        weapon.muzzleLight = muzzleLight;
+        weapon.muzzleTip = muzzleTip;
+
+        // --- Zombie spawn points (inside the street canyons) -------------------------
+        Transform spawnGroup = NewGroup("Spawn Points", world);
+        Transform[] spawnPoints = new Transform[streetX.Length];
+        for (int i = 0; i < streetX.Length; i++)
+        {
+            GameObject spawnPoint = new GameObject($"Spawn Canyon {i + 1}");
+            spawnPoint.transform.SetParent(spawnGroup, false);
+            spawnPoint.transform.localPosition = new Vector3(streetX[i], 0.1f, 55f);
+            spawnPoints[i] = spawnPoint.transform;
+        }
+
+        // --- Game systems --------------------------------------------------------------
+        GameObject systems = new GameObject("Game Systems");
+        BarrierHealth barrierHealth = systems.AddComponent<BarrierHealth>();
+        ZombieSpawner spawner = systems.AddComponent<ZombieSpawner>();
+        spawner.barrier = barrierHealth;
+        spawner.spawnPoints = spawnPoints;
+        spawner.walkerPrefab = AssetZombieBuilder.EnsureWalkerPrefab();
+        systems.AddComponent<HudController>();
+
+        // --- NavMesh bake (after all geometry exists) -----------------------------------
+        GameObject navigation = new GameObject("Navigation");
+        NavMeshSurface surface = navigation.AddComponent<NavMeshSurface>();
+        surface.collectObjects = CollectObjects.All;
+        surface.useGeometry = UnityEngine.AI.NavMeshCollectGeometry.PhysicsColliders;
+        surface.BuildNavMesh();
+        if (surface.navMeshData != null)
+        {
+            AssetDatabase.CreateAsset(surface.navMeshData, "Assets/Scenes/DeadWave_Stage_NavMesh.asset");
+        }
+        else
+        {
+            Debug.LogWarning("Dead Wave: NavMesh bake produced no data.");
+        }
+
         // --- Save ----------------------------------------------------------------------
         AssetDatabase.SaveAssets();
         bool saved = EditorSceneManager.SaveScene(scene, ScenePath);
@@ -255,6 +377,45 @@ public static class DeadWaveStageBuilder
         Transform t = new GameObject(name).transform;
         t.SetParent(parent, false);
         return t;
+    }
+
+    /// <summary>
+    /// Combined renderer bounds of a hierarchy, expressed in another transform's
+    /// local space (corner-accurate, handles any rotation/scale).
+    /// </summary>
+    private static Bounds CalculateBoundsInSpace(Transform target, Transform space)
+    {
+        Renderer[] renderers = target.GetComponentsInChildren<Renderer>();
+        Bounds result = new Bounds(Vector3.zero, Vector3.zero);
+        bool hasAny = false;
+
+        foreach (Renderer renderer in renderers)
+        {
+            Bounds worldBounds = renderer.bounds;
+            Vector3 extents = worldBounds.extents;
+            for (int xi = -1; xi <= 1; xi += 2)
+            {
+                for (int yi = -1; yi <= 1; yi += 2)
+                {
+                    for (int zi = -1; zi <= 1; zi += 2)
+                    {
+                        Vector3 corner = worldBounds.center + Vector3.Scale(extents, new Vector3(xi, yi, zi));
+                        Vector3 local = space.InverseTransformPoint(corner);
+                        if (!hasAny)
+                        {
+                            result = new Bounds(local, Vector3.zero);
+                            hasAny = true;
+                        }
+                        else
+                        {
+                            result.Encapsulate(local);
+                        }
+                    }
+                }
+            }
+        }
+
+        return result;
     }
 
     private static GameObject Box(Transform parent, Material material, string name, Vector3 position, Vector3 scale)
@@ -382,6 +543,59 @@ public static class DeadWaveStageBuilder
 
         EditorUtility.SetDirty(material);
         return material;
+    }
+
+    private static Material BuildAkmUrpMaterial()
+    {
+        const string textureFolder = "Assets/DelthorGames/AKM/Textures";
+
+        Material material = GetOrCreateMaterial("AKM_URP", Color.white, 1f);
+        material.SetFloat("_Metallic", 1f); // scaled by the metallic-smoothness map
+
+        Texture albedo = AssetDatabase.LoadAssetAtPath<Texture2D>($"{textureFolder}/AKMDis_Mat_AlbedoTransparency.png");
+        Texture normal = AssetDatabase.LoadAssetAtPath<Texture2D>($"{textureFolder}/AKMDis_Mat4K_NormalOpenGLFix.png");
+        Texture metallicSmooth = AssetDatabase.LoadAssetAtPath<Texture2D>($"{textureFolder}/AKMDis_Mat_MetallicSmoothness.png");
+        Texture occlusion = AssetDatabase.LoadAssetAtPath<Texture2D>($"{textureFolder}/AKMDis_Mat_AO.png");
+        Texture emission = AssetDatabase.LoadAssetAtPath<Texture2D>($"{textureFolder}/AKMDis_Mat_Emission.png");
+
+        if (albedo != null)
+        {
+            material.SetTexture("_BaseMap", albedo);
+        }
+        if (normal != null)
+        {
+            EnsureNormalMapImport($"{textureFolder}/AKMDis_Mat4K_NormalOpenGLFix.png");
+            material.SetTexture("_BumpMap", normal);
+            material.EnableKeyword("_NORMALMAP");
+        }
+        if (metallicSmooth != null)
+        {
+            material.SetTexture("_MetallicGlossMap", metallicSmooth);
+            material.EnableKeyword("_METALLICSPECGLOSSMAP");
+        }
+        if (occlusion != null)
+        {
+            material.SetTexture("_OcclusionMap", occlusion);
+        }
+        if (emission != null)
+        {
+            material.SetTexture("_EmissionMap", emission);
+            material.SetColor("_EmissionColor", Color.white);
+            material.EnableKeyword("_EMISSION");
+        }
+
+        EditorUtility.SetDirty(material);
+        return material;
+    }
+
+    private static void EnsureNormalMapImport(string assetPath)
+    {
+        TextureImporter importer = AssetImporter.GetAtPath(assetPath) as TextureImporter;
+        if (importer != null && importer.textureType != TextureImporterType.NormalMap)
+        {
+            importer.textureType = TextureImporterType.NormalMap;
+            importer.SaveAndReimport();
+        }
     }
 
     private static void EnsureFolder(string parent, string name)

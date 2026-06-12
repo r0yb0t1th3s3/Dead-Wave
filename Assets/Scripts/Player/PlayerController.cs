@@ -31,6 +31,12 @@ public sealed class PlayerController : MonoBehaviour
     private float pitch;
     private float verticalVelocity;
 
+    /// <summary>Additive camera pitch in degrees (weapon recoil writes here; negative kicks up).</summary>
+    public float ExternalPitchOffset { get; set; }
+
+    /// <summary>Time of the most recent cursor lock; lets the weapon ignore the relock click.</summary>
+    public static float LastCursorLockTime { get; private set; }
+
     private void Awake()
     {
         body = GetComponent<CharacterController>();
@@ -83,6 +89,7 @@ public sealed class PlayerController : MonoBehaviour
         HandleCursor();
         HandleLook();
         HandleMovement();
+        ApplyCameraPitch();
     }
 
     private void HandleCursor()
@@ -109,9 +116,13 @@ public sealed class PlayerController : MonoBehaviour
         transform.Rotate(0f, lookDelta.x, 0f);
 
         pitch = Mathf.Clamp(pitch - lookDelta.y, minPitch, maxPitch);
+    }
+
+    private void ApplyCameraPitch()
+    {
         if (cameraTransform != null)
         {
-            cameraTransform.localRotation = Quaternion.Euler(pitch, 0f, 0f);
+            cameraTransform.localRotation = Quaternion.Euler(pitch + ExternalPitchOffset, 0f, 0f);
         }
     }
 
@@ -138,5 +149,9 @@ public sealed class PlayerController : MonoBehaviour
     {
         Cursor.lockState = locked ? CursorLockMode.Locked : CursorLockMode.None;
         Cursor.visible = !locked;
+        if (locked)
+        {
+            LastCursorLockTime = Time.time;
+        }
     }
 }
